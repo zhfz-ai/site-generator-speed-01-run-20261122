@@ -1,7 +1,9 @@
 // SwiftSite: a fast drop-in for makefun-site 1.0.0. run(input) returns the
 // same output tree (path -> text) as makefun-site's build for every input,
-// computed with bulk-run escaping, an ASCII slug fast path, a regex-free
-// front-matter and Markdown scanner, and templates compiled to functions.
+// computed with native-regex escaping, an ASCII slug fast path, a regex-free
+// front-matter and Markdown scanner, indexOf-based emphasis search, lazy
+// reading-time counts, and templates compiled to functions (with per-build
+// caching of includes that read only site/tags/recent).
 
 const ESCAPABLE_HTML = /[&<>"']/;
 
@@ -26,40 +28,18 @@ function escapeHtml(text) {
   return out + text.slice(start);
 }
 
+// Single-character escape by char code (only the five escapable codes set).
+const ESC1 = new Array(128);
+ESC1[38] = '&amp;';
+ESC1[60] = '&lt;';
+ESC1[62] = '&gt;';
+ESC1[34] = '&quot;';
+ESC1[39] = '&#39;';
+
 const SLUG_MAX = 64;
 const MARK_RE = /\p{M}/gu;
 
-// The slug of text, NFKD with marks dropped; pure-ASCII text skips normalize.
-function slugifyRaw(text) {
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) >= 128) { ascii = false; break; }
-  }
-  let out = '';
-  let gap = false;
-  if (ascii) {
-    for (let i = 0; i < text.length; i++) {
-      const c = text.charCodeAt(i);
-      let keep = -1;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep === -1) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
-    }
-  } else {
-    const plain = text.normalize('NFKD').replace(MARK_RE, '');
-    for (const ch of plain) {
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
-    }
-  }
+function finishSlug(out) {
   if (out.length > SLUG_MAX) {
     out = out.slice(0, SLUG_MAX);
     let end = out.length;
@@ -67,6 +47,40 @@ function slugifyRaw(text) {
     out = out.slice(0, end);
   }
   return out === '' ? 'untitled' : out;
+}
+
+// The slug of text, NFKD with marks dropped; pure-ASCII text skips normalize.
+function slugifyRaw(text) {
+  let out = '';
+  let gap = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 128) return slugifyUnicode(text);
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) { gap = out.length > 0; continue; }
+    if (gap) out += '-';
+    gap = false;
+    out += String.fromCharCode(keep);
+  }
+  return finishSlug(out);
+}
+
+function slugifyUnicode(text) {
+  const plain = text.normalize('NFKD').replace(MARK_RE, '');
+  let out = '';
+  let gap = false;
+  for (const ch of plain) {
+    let keep = null;
+    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+    if (keep === null) { gap = out.length > 0; continue; }
+    if (gap) out += '-';
+    gap = false;
+    out += keep;
+  }
+  return finishSlug(out);
 }
 
 function uniqueSlug(slug, taken) {
@@ -86,16 +100,15 @@ function longDateRaw(date) {
 }
 
 // Runs of non-whitespace characters in text (the body's word count).
-const WS_RE = /\s/;
-const WS_TABLE = new Uint8Array(128);
-for (const c of [9, 10, 11, 12, 13, 32]) WS_TABLE[c] = 1;
+// Whitespace is JavaScript's \s: ASCII 9-13 and 32, plus the Unicode spaces.
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS_TABLE[c] = 1;
+for (let c = 8192; c <= 8202; c++) WS_TABLE[c] = 1;
 function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c < 128 ? WS_TABLE[c] === 1 : WS_RE.test(text[i]);
-    if (ws) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)] === 1) inWord = false;
     else if (!inWord) { inWord = true; count++; }
   }
   return count;
@@ -116,6 +129,11 @@ function trimLine(line) {
     b--;
   }
   return a === 0 && b === line.length ? line : line.slice(a, b);
+}
+
+// Lines joined by "\n" (a single line needs no join).
+function joinLines(parts) {
+  return parts.length === 1 ? parts[0] : parts.join('\n');
 }
 
 // ---------------------------------------------------------------- front matter
@@ -279,25 +297,45 @@ function parseFrontMatter(text) {
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 const TARGET_WS = /\s/;
+const WS_RE = /\s/;
 
 // First index from `from` where s holds `what` outside a backslash escape.
+// Candidates come from indexOf; an escape pair (\ + escapable char) starting
+// before a candidate consumes its two characters, so the search jumps past it.
 function findUnescaped(s, what, from) {
+  const n = s.length;
   const wlen = what.length;
-  for (let j = from; j <= s.length - wlen; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (s.startsWith(what, j)) return j;
+  let j = from;
+  while (j <= n - wlen) {
+    const k = s.indexOf(what, j);
+    if (k === -1 || k > n - wlen) return -1;
+    let b = s.indexOf('\\', j);
+    let jumped = false;
+    while (b !== -1 && b < k) {
+      if (b + 1 < n && ESCAPABLE.has(s[b + 1])) { j = b + 2; jumped = true; break; }
+      b = s.indexOf('\\', b + 1);
+    }
+    if (!jumped) return k;
   }
   return -1;
 }
 
 // First single * from `from` (not part of **), outside an escape.
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') { j++; continue; }
-    return j;
+  const n = s.length;
+  let j = from;
+  while (j < n) {
+    const k = s.indexOf('*', j);
+    if (k === -1) return -1;
+    let b = s.indexOf('\\', j);
+    let jumped = false;
+    while (b !== -1 && b < k) {
+      if (b + 1 < n && ESCAPABLE.has(s[b + 1])) { j = b + 2; jumped = true; break; }
+      b = s.indexOf('\\', b + 1);
+    }
+    if (jumped) continue;
+    if (s[k + 1] === '*') { j = k + 2; continue; }
+    return k;
   }
   return -1;
 }
@@ -305,9 +343,6 @@ function findSingleStar(s, from) {
 // Characters that end a plain run: markup starters and HTML-escapable ones.
 const SPECIAL_TABLE = new Uint8Array(128);
 for (const c of [92, 96, 42, 91, 38, 60, 62, 34, 39]) SPECIAL_TABLE[c] = 1;
-function isSpecial(c) {
-  return c < 128 && SPECIAL_TABLE[c] === 1;
-}
 
 // s rendered inline; env.link(target) gives a link's href.
 function inline(s, env) {
@@ -316,15 +351,20 @@ function inline(s, env) {
   const n = s.length;
   while (i < n) {
     const c = s.charCodeAt(i);
-    if (!isSpecial(c)) {
+    if (!(c < 128 && SPECIAL_TABLE[c] === 1)) {
       let j = i + 1;
-      while (j < n && !isSpecial(s.charCodeAt(j))) j++;
+      while (j < n) {
+        const cc = s.charCodeAt(j);
+        if (cc < 128 && SPECIAL_TABLE[cc] === 1) break;
+        j++;
+      }
       out += s.slice(i, j);
       i = j;
       continue;
     }
     if (c === 92 && i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-      out += escapeHtml(s[i + 1]);
+      // No escapable character is HTML-escapable, so it stands as itself.
+      out += s[i + 1];
       i += 2;
       continue;
     }
@@ -365,7 +405,7 @@ function inline(s, env) {
       i++;
       continue;
     }
-    out += escapeHtml(s[i]);
+    out += ESC1[c] ?? s[i];
     i++;
   }
   return out;
@@ -469,8 +509,8 @@ function renderMarkdown(src, env, slugOf) {
       while (i < lines.length && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"';
-      let inner = '';
-      for (const l of body) inner += escapeHtml(l) + '\n';
+      // Each line escaped and ended by "\n" is the joined body escaped, plus "\n".
+      const inner = body.length === 0 ? '' : escapeHtml(body.join('\n')) + '\n';
       blocks.push('<pre><code' + cls + '>' + inner + '</code></pre>');
       continue;
     }
@@ -493,7 +533,7 @@ function renderMarkdown(src, env, slugOf) {
         if (t !== '') parts.push(t);
         i++;
       }
-      blocks.push(parts.length === 0 ? '<blockquote>\n</blockquote>' : '<blockquote>\n<p>' + inline(parts.join('\n'), env) + '</p>\n</blockquote>');
+      blocks.push(parts.length === 0 ? '<blockquote>\n</blockquote>' : '<blockquote>\n<p>' + inline(joinLines(parts), env) + '</p>\n</blockquote>');
       continue;
     }
     // list?
@@ -539,14 +579,14 @@ function renderMarkdown(src, env, slugOf) {
       const tag = ordered ? 'ol' : 'ul';
       const open = ordered && start !== 1 ? '<ol start="' + start + '">' : '<' + tag + '>';
       let inner = '';
-      for (const parts of items) inner += '<li>' + inline(parts.join('\n'), env) + '</li>\n';
+      for (const parts of items) inner += '<li>' + inline(joinLines(parts), env) + '</li>\n';
       blocks.push(open + '\n' + inner + '</' + tag + '>');
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), env);
+    const html = inline(joinLines(body), env);
     if (excerpt === null) excerpt = html;
     blocks.push('<p>' + html + '</p>');
   }
@@ -560,6 +600,15 @@ const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FOR_RE = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
 const IF_RE = /^if (not )?(\S+)$/;
 const INCLUDE_RE = /^include "([a-z0-9-]+)"$/;
+
+// Property names that live on Object.prototype or Array.prototype. A path
+// segment with one of these names must go through the own-property check;
+// any other segment can be read directly (template values are plain objects,
+// arrays and primitives only, so a direct read gives the same answer).
+const DANGER = new Set([
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Array.prototype),
+]);
 
 class TemplateError extends Error {}
 
@@ -648,10 +697,27 @@ function tplGet(v, k) {
   return v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined;
 }
 
+// tplGet for a key that is on no prototype (checked at compile time).
+function tplGetF(v, k) {
+  return v !== null && typeof v === 'object' ? v[k] : undefined;
+}
+
 function tplLookup(scope, name) {
   let s = scope;
   while (s !== null && !Object.hasOwn(s.vars, name)) s = s.parent;
   return s === null ? undefined : s.vars[name];
+}
+
+// tplLookup for a name that is on no prototype (checked at compile time).
+function tplLookupF(scope, name) {
+  let s = scope;
+  while (s !== null) {
+    const v = s.vars[name];
+    if (v !== undefined) return v;
+    if (Object.hasOwn(s.vars, name)) return undefined;
+    s = s.parent;
+  }
+  return undefined;
 }
 
 function tplText(v) {
@@ -676,6 +742,42 @@ function nodesHaveInclude(nodes) {
   return false;
 }
 
+// Whether nodes read the enclosing loop's `loop` (a nested for's body reads
+// its own loop instead; its path is read in the enclosing scope).
+function nodesUseLoop(nodes) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw') { if (n.path[0] === 'loop') return true; }
+    else if (n.kind === 'if') {
+      if (n.path[0] === 'loop' || nodesUseLoop(n.then) || (n.else !== null && nodesUseLoop(n.else))) return true;
+    } else if (n.kind === 'for') { if (n.path[0] === 'loop') return true; }
+  }
+  return false;
+}
+
+// Free first-names of a template body (names read but not bound by an
+// enclosing for), and the templates it includes. Include expansion is
+// conservative: an included template's free names count as free here even
+// when a for at the include site would bind them.
+function directFree(nodes, bound, out, incs) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+    } else if (n.kind === 'if') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      directFree(n.then, bound, out, incs);
+      if (n.else !== null) directFree(n.else, bound, out, incs);
+    } else if (n.kind === 'for') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      const inner = new Set(bound);
+      inner.add(n.name);
+      inner.add('loop');
+      directFree(n.body, inner, out, incs);
+    } else if (n.kind === 'include') {
+      incs.add(n.name);
+    }
+  }
+}
+
 // One parsed template compiled to function(R, S, D, H) -> string.
 function compileTemplate(nodes) {
   let uid = 0;
@@ -690,9 +792,9 @@ function compileTemplate(nodes) {
       for (let k = scopes.length - 1; k >= 0; k--) {
         if (scopes[k].name === first && first !== 'loop') { bound = scopes[k].v; break; }
       }
-      expr = bound !== null ? bound : 'H.lk(' + sVar + ',' + JSON.stringify(first) + ')';
+      expr = bound !== null ? bound : (DANGER.has(first) ? 'H.lk(' : 'H.lkF(') + sVar + ',' + JSON.stringify(first) + ')';
     }
-    for (let k = 1; k < path.length; k++) expr = 'H.get(' + expr + ',' + JSON.stringify(path[k]) + ')';
+    for (let k = 1; k < path.length; k++) expr = (DANGER.has(path[k]) ? 'H.get(' : 'H.getF(') + expr + ',' + JSON.stringify(path[k]) + ')';
     return expr;
   }
   function gen(list, sVar) {
@@ -716,11 +818,12 @@ function compileTemplate(nodes) {
         const v = 'v' + id;
         const l = 'l' + id;
         const needScope = nodesHaveInclude(n.body);
+        const needLoop = needScope || nodesUseLoop(n.body);
         const s2 = needScope ? 's' + id : sVar;
         code += 'var ' + a + '=' + pathExpr(n.path, sVar) + ';';
         code += 'if(Array.isArray(' + a + ')){for(var ' + ix + '=0;' + ix + '<' + a + '.length;' + ix + '++){';
         code += 'var ' + v + '=' + a + '[' + ix + '];';
-        code += 'var ' + l + '={index:' + ix + '+1,first:' + ix + '===0,last:' + ix + '===' + a + '.length-1,length:' + a + '.length};';
+        if (needLoop) code += 'var ' + l + '={index:' + ix + '+1,first:' + ix + '===0,last:' + ix + '===' + a + '.length-1,length:' + a + '.length};';
         if (needScope) code += 'var ' + s2 + '={vars:{' + JSON.stringify(n.name) + ':' + v + ',loop:' + l + '},parent:' + sVar + '};';
         scopes.push({ name: n.name, v, l });
         code += gen(n.body, s2);
@@ -786,24 +889,69 @@ export function run(input) {
   };
 
   const templates = new Map();
+  const tplNodes = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
+      const nodes = parseTemplate(name, input.templates[name]);
+      tplNodes.set(name, nodes);
+      templates.set(name, compileTemplate(nodes));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  // Templates whose output at the root scope depends only on site, tags and
+  // recent (the same objects for every render of this build) render once.
+  const freeOf = new Map();
+  const incsOf = new Map();
+  for (const [name, nodes] of tplNodes) {
+    const free = new Set();
+    const incs = new Set();
+    directFree(nodes, new Set(), free, incs);
+    freeOf.set(name, free);
+    incsOf.set(name, incs);
+  }
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [name, incs] of incsOf) {
+      const free = freeOf.get(name);
+      for (const inc of incs) {
+        const sub = freeOf.get(inc);
+        if (sub === undefined) continue;
+        for (const f of sub) {
+          if (!free.has(f)) { free.add(f); changed = true; }
+        }
+      }
+    }
+  }
+  const rootOnly = new Set();
+  for (const [name, free] of freeOf) {
+    let ok = true;
+    for (const f of free) {
+      if (f !== 'site' && f !== 'tags' && f !== 'recent') { ok = false; break; }
+    }
+    if (ok) rootOnly.add(name);
+  }
+  const incCache = new Map();
   const H = {
     esc: escapeHtml,
     txt: tplText,
     tru: tplTruthy,
     get: tplGet,
+    getF: tplGetF,
     lk: tplLookup,
+    lkF: tplLookupF,
     inc: (name, R, S, D, HH) => {
       const t = templates.get(name);
-      return t !== undefined && D < INCLUDE_DEPTH ? t(R, S, D + 1, HH) : '';
+      if (t === undefined || D >= INCLUDE_DEPTH) return '';
+      if (S.parent === null && rootOnly.has(name)) {
+        const key = name + '\0' + D;
+        let hit = incCache.get(key);
+        if (hit === undefined) { hit = t(R, S, D + 1, HH); incCache.set(key, hit); }
+        return hit;
+      }
+      return t(R, S, D + 1, HH);
     },
   };
   const base = input.site.base_url.replace(/\/+$/, '');
@@ -854,15 +1002,20 @@ export function run(input) {
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
   const linkCache = new Map();
+  const brokenKeys = new Set();
   for (const s of sources) {
     const dir = dirOf(s.path);
     const dirParts = dir === '' ? [] : dir.split('/');
     const env = {
       link: (target) => {
-        const cacheKey = s.path + '\0' + target;
+        const cacheKey = dir + '\0' + target;
         let hit = linkCache.get(cacheKey);
-        if (hit !== undefined) return hit;
+        if (hit !== undefined) {
+          if (brokenKeys.has(cacheKey)) broken.add('broken-link ' + s.path + ' -> ' + target);
+          return hit;
+        }
         let result;
+        let isBroken = false;
         if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) {
           result = target;
         } else {
@@ -872,7 +1025,11 @@ export function run(input) {
           const path = rel === '' ? null : resolvePath(dirParts, rel);
           if (path !== null && bySource.has(path)) result = bySource.get(path).url + frag;
           else if (path !== null && staticPaths.has(path)) result = base + '/' + path + frag;
-          else { broken.add('broken-link ' + s.path + ' -> ' + target); result = target; }
+          else { isBroken = true; result = target; }
+        }
+        if (isBroken) {
+          brokenKeys.add(cacheKey);
+          broken.add('broken-link ' + s.path + ' -> ' + target);
         }
         linkCache.set(cacheKey, result);
         return result;
@@ -917,27 +1074,51 @@ export function run(input) {
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
+  const tagItem = (t) => t._item ??= { name: t.name, slug: t.slug, url: t.url };
+  // reading_minutes counted on first template read, then held as a value;
+  // a layout that never reads it never pays for the count.
+  const lazyMinutes = (obj, s) => {
+    Object.defineProperty(obj, 'reading_minutes', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        let v = s._rm;
+        if (v === undefined) { v = Math.max(1, Math.ceil(wordsOf(s.body) / 200)); s._rm = v; }
+        Object.defineProperty(obj, 'reading_minutes', { value: v, enumerable: true, configurable: true, writable: true });
+        return v;
+      },
+    });
+    return obj;
+  };
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : dateOf(s.data.date) });
-  const cardOf = (s) => ({
+  const cardOf = (s) => lazyMinutes({
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
     date_long: s.data.date === undefined ? '' : dateOf(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+    tags: s.tagRefs.map(tagItem),
+  }, s);
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
-  const pageOf = (s) => ({
-    ...(s.post ? cards.get(s) : cardOf(s)),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
+  const pageOf = (s) => {
+    const card = s.post ? cards.get(s) : cardOf(s);
+    return lazyMinutes({
+      title: card.title,
+      url: card.url,
+      date: card.date,
+      date_long: card.date_long,
+      summary: card.summary,
+      excerpt: card.excerpt,
+      tags: card.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    }, s);
+  };
 
   // 7. layouts.
   const output = {};
