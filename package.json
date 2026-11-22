@@ -1,0 +1,1 @@
+{"description":"A fast drop-in for makefun-site 1.0.0: builds the same output tree for less CPU.","engines":{"node":">=22"},"license":"MIT","main":"solve.js","name":"swiftsite","type":"module","version":"1.0.0"}
